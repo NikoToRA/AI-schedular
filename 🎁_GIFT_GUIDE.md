@@ -189,10 +189,37 @@ Google Apps Script に添付ファイルをコピペするだけ！
 → `notion-calendar-sync.gs` のセットアップガイド参照
 → Notion Integration の作成手順をサポート
 
+### 🔗 Notion連携の追加（オプション）
+
+**さらに高度な機能として、Notionとの連携も可能です:**
+
+#### Notion連携で追加される機能
+- 📝 カレンダーとNotionの双方向自動同期
+- 📋 Notion Databaseでのタスク管理
+- 🔄 重複防止機能付きデータ連携
+
+#### 設定方法
+1. `NOTION_SETUP_GUIDE.md` の3ステップガイドに従う
+2. Integration Token と Database ID を設定
+3. `testNotionConnection()` で動作確認
+
+#### 設定支援
+```javascript
+// 設定ガイド表示
+showNotionConfigGuide()
+
+// 設定値確認
+setNotionConfig('your_token', 'your_database_id')
+
+// 接続テスト
+testNotionConnection()
+```
+
 ### 🆘 トラブル時の対応
 1. まずは`systemHealthCheck()`関数でシステム状態確認
 2. ログを確認して具体的なエラーを特定
-3. 必要に応じて一緒に解決
+3. Notion連携エラーの場合は`NOTION_SETUP_GUIDE.md`を参照
+4. 必要に応じて一緒に解決
 
 ---
 

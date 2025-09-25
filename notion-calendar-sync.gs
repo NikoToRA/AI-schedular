@@ -11,11 +11,20 @@
  */
 
 // ========================================
-// Notion設定（設定してください）
+// 🔧 NOTION設定 - ここに入力してください！
 // ========================================
 const NOTION_CONFIG = {
-  INTEGRATION_TOKEN: '', // Notion インテグレーション トークンを設定
-  DATABASE_ID: '',       // NotionデータベースIDを設定
+  // 👇 ここにNotion Integration Token を入力（必須）
+  // 取得方法: https://www.notion.so/my-integrations で作成
+  // 例: 'secret_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk123'
+  INTEGRATION_TOKEN: '★★★ここにIntegration Tokenを入力★★★',
+
+  // 👇 ここにNotion Database ID を入力（必須）
+  // 取得方法: NotionデータベースのURLから取得
+  // URL例: https://notion.so/workspace/1234567890abcdef?v=...
+  // 例: '1234567890abcdef1234567890abcdef'
+  DATABASE_ID: '★★★ここにDatabase IDを入力★★★',
+
   API_VERSION: '2022-06-28'
 };
 
@@ -28,8 +37,18 @@ const NOTION_CONFIG = {
  */
 function getNotionDatabaseProperties() {
   try {
-    if (!NOTION_CONFIG.INTEGRATION_TOKEN || !NOTION_CONFIG.DATABASE_ID) {
-      throw new Error('Notion設定が不完全です。INTEGRATION_TOKENとDATABASE_IDを設定してください。');
+    // 設定チェック
+    if (!NOTION_CONFIG.INTEGRATION_TOKEN || NOTION_CONFIG.INTEGRATION_TOKEN.includes('★')) {
+      throw new Error('❌ NOTION設定エラー: INTEGRATION_TOKENが設定されていません。\n' +
+                      '👉 https://www.notion.so/my-integrations でIntegrationを作成し、\n' +
+                      '   TokenをNOTION_CONFIG.INTEGRATION_TOKENに設定してください。');
+    }
+
+    if (!NOTION_CONFIG.DATABASE_ID || NOTION_CONFIG.DATABASE_ID.includes('★')) {
+      throw new Error('❌ NOTION設定エラー: DATABASE_IDが設定されていません。\n' +
+                      '👉 NotionデータベースのURLからIDを取得し、\n' +
+                      '   NOTION_CONFIG.DATABASE_IDに設定してください。\n' +
+                      '   URL例: https://notion.so/workspace/【ここがDatabase ID】?v=...');
     }
 
     const url = `https://api.notion.com/v1/databases/${NOTION_CONFIG.DATABASE_ID}`;
@@ -576,6 +595,86 @@ function createNotionSyncSheet(spreadsheet) {
 
   Logger.log('Notion同期結果シート作成完了');
   return sheet;
+}
+
+// ========================================
+// 🔧 簡単設定・セットアップ関数
+// ========================================
+
+/**
+ * 🎯 簡単設定関数 - この関数で設定を入力してください！
+ * @param {string} integrationToken - Notion Integration Token
+ * @param {string} databaseId - Notion Database ID
+ */
+function setNotionConfig(integrationToken, databaseId) {
+  try {
+    Logger.log('🔧 Notion設定を開始...');
+
+    // 入力チェック
+    if (!integrationToken || !databaseId) {
+      throw new Error('❌ 設定エラー: TokenとDatabase IDの両方を入力してください');
+    }
+
+    if (integrationToken.length < 10 || databaseId.length < 10) {
+      throw new Error('❌ 設定エラー: TokenまたはIDが短すぎます。正しい値を入力してください');
+    }
+
+    // 実際のコード内で設定を変更するためのガイド表示
+    Logger.log('✅ 入力された設定:');
+    Logger.log(`   Integration Token: ${integrationToken.substring(0, 20)}...`);
+    Logger.log(`   Database ID: ${databaseId}`);
+    Logger.log('');
+    Logger.log('👉 次の手順:');
+    Logger.log('1. コード内のNOTION_CONFIGセクションを開く');
+    Logger.log('2. INTEGRATION_TOKEN に以下を設定:');
+    Logger.log(`   '${integrationToken}'`);
+    Logger.log('3. DATABASE_ID に以下を設定:');
+    Logger.log(`   '${databaseId}'`);
+    Logger.log('4. 保存後、testNotionConnection() でテスト実行');
+
+    return true;
+
+  } catch (error) {
+    Logger.log(`❌ 設定エラー: ${error.toString()}`);
+    return false;
+  }
+}
+
+/**
+ * 📋 設定ガイドを表示
+ */
+function showNotionConfigGuide() {
+  const guide = `
+🔧 Notion設定ガイド - 3ステップで完了！
+=======================================
+
+【ステップ1: Integration Token取得】
+1. https://www.notion.so/my-integrations を開く
+2. 「New integration」をクリック
+3. 名前を「AI Scheduler」等に設定して作成
+4. 「Internal Integration Token」をコピー
+   （secret_で始まる長い文字列）
+
+【ステップ2: Database ID取得】
+1. Notionでスケジュール用データベースを作成
+2. データベースを開いた状態でURLをコピー
+3. URLの形式: https://notion.so/workspace/★ここがID★?v=...
+4. ★の部分（32文字）がDatabase ID
+
+【ステップ3: 設定入力】
+コード内のNOTION_CONFIGセクション（14-29行目）で:
+- INTEGRATION_TOKEN: '取得したToken'
+- DATABASE_ID: '取得したID'
+に置き換えてください
+
+【確認】
+設定完了後、testNotionConnection() を実行してテスト！
+
+💡 困ったら setNotionConfig('Token', 'ID') で値を確認できます
+`;
+
+  Logger.log(guide);
+  return guide;
 }
 
 // ========================================
