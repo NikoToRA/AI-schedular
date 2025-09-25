@@ -1,0 +1,8 @@
+# 最小版では不要なファイルを除外
+🎁_GIFT_GUIDE.md
+QUICK_SETUP_CARD.md
+NOTION_SETUP_GUIDE.md
+README.md
+.git/
+.gitignore
+*.md
