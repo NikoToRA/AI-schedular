@@ -37,6 +37,13 @@ const SYNC = {
   BURST_RUNS: 3                     // 変更検出後、5分で追従する回数
 };
 
+// 🧹 ログ／記録のスプレッドシート行数の上限（超過分は古い順に削除）
+const LOG_RETENTION = {
+  ANALYSIS_MAX_ROWS: 2000,      // 分析結果シートの最大データ行数（ヘッダ除く）
+  CONFLICTS_MAX_ROWS: 2000,     // 衝突シートの最大データ行数（ヘッダ除く）
+  NOTION_SYNC_MAX_ROWS: 1000    // Notion同期結果シートの最大データ行数（ヘッダ除く）
+};
+
 // 🔗 Notion連携設定（オプション - 連携する場合のみ設定）
 const NOTION_CONFIG = {
   // 👇【設定1】Notion Integration Tokenをここに入力
@@ -107,23 +114,26 @@ function main() {
     }
 
     // Notion連携が設定されている場合は同期実行
+    let __syncResult = null;
     if (isNotionConfigured()) {
       try {
         Logger.log('Notion連携が設定されています。同期を実行します...');
         const syncResult = SYNC.ENABLE_BIDIRECTIONAL ? runBidirectionalSync() : runCalendarToNotionOnly();
+        __syncResult = syncResult;
         Logger.log(`Notion同期完了: カレンダー→Notion ${syncResult.calendarToNotion.created}件作成`);
         // 人間向けの要約ログ（スプレッドシートは変更せずログのみ）
         try {
           const cal = syncResult.calendarToNotion || { created: 0, updated: 0, duplicates: 0, errors: 0 };
           Logger.log(`新規追加タスク: ${cal.created}件, 変更タスク: ${cal.updated || 0}件, 重複タスク: ${cal.duplicates || 0}件, 失敗: ${cal.errors || 0}件`);
         } catch (e) {}
-        // 同期結果に基づいてポーリング間隔を動的調整（最低限）
-        if (SYNC.DYNAMIC_INTERVAL) {
-          try { adjustPollingIntervalIfNeeded(syncResult); } catch (e) { Logger.log(`ポーリング調整エラー: ${e}`); }
-        }
       } catch (notionError) {
         Logger.log(`Notion同期エラー: ${notionError.toString()}`);
       }
+    }
+
+    // ポーリング間隔の動的調整（Notion未設定でも実行し、安定とみなす）
+    if (SYNC.DYNAMIC_INTERVAL) {
+      try { adjustPollingIntervalIfNeeded(__syncResult || {}); } catch (e) { Logger.log(`ポーリング調整エラー: ${e}`); }
     }
 
     Logger.log('AIスケジューラ完了: ' + new Date());
@@ -818,6 +828,8 @@ function saveAnalysisResults(analysis) {
 
     // 新しい行として追加
     sheet.appendRow(rowData);
+    // 行数が多すぎる場合は古いデータから削除
+    pruneSheetRows_(sheet, 1, LOG_RETENTION.ANALYSIS_MAX_ROWS);
 
     // 衝突がある場合は衝突シートにも保存
     if (analysis.conflicts.length > 0) {
@@ -852,6 +864,8 @@ function saveConflictData(conflicts, spreadsheet) {
       sheet.appendRow(rowData);
     });
 
+    // 行数が多すぎる場合は古いデータから削除
+    pruneSheetRows_(sheet, 1, LOG_RETENTION.CONFLICTS_MAX_ROWS);
     Logger.log(`衝突データ保存完了: ${conflicts.length}件`);
 
   } catch (error) {
@@ -1476,9 +1490,32 @@ function saveSyncResults(syncResult) {
     ];
 
     sheet.appendRow(rowData);
+    // 行数が多すぎる場合は古いデータから削除
+    pruneSheetRows_(sheet, 1, LOG_RETENTION.NOTION_SYNC_MAX_ROWS);
 
   } catch (error) {
     Logger.log(`同期結果保存エラー: ${error.toString()}`);
+  }
+}
+
+/**
+ * シートのデータ行数を上限以内に保つ（古い順に削除）
+ * headerRows: ヘッダー行数（通常1）
+ * maxDataRows: データ行の上限
+ */
+function pruneSheetRows_(sheet, headerRows, maxDataRows) {
+  try {
+    if (!sheet || !maxDataRows || maxDataRows <= 0) return;
+    const lastRow = sheet.getLastRow();
+    const dataRows = Math.max(0, lastRow - headerRows);
+    const overflow = dataRows - maxDataRows;
+    if (overflow > 0) {
+      // ヘッダー直下から overflow 行分を削除
+      sheet.deleteRows(headerRows + 1, overflow);
+      Logger.log(`シート「${sheet.getName()}」の古い行を${overflow}件削除（上限${maxDataRows}件）`);
+    }
+  } catch (e) {
+    Logger.log(`シート行削減エラー(${sheet && sheet.getName ? sheet.getName() : '?' }): ${e}`);
   }
 }
 
