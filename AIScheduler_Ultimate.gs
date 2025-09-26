@@ -32,7 +32,9 @@ const SYNC = {
   DYNAMIC_INTERVAL: true,           // 成功が続けばポーリング間隔を延長
   SHORT_INTERVAL_MIN: 5,            // 通常間隔（分）
   LONG_INTERVAL_MIN: 30,            // 省コスト間隔（分）
-  STABLE_THRESHOLD: 3               // 連続安定回数で延長
+  STABLE_THRESHOLD: 3,              // 連続安定回数で延長
+  INTERVALS: [5, 15, 30, 60],       // アダプティブ間隔の階段
+  BURST_RUNS: 3                     // 変更検出後、5分で追従する回数
 };
 
 // 🔗 Notion連携設定（オプション - 連携する場合のみ設定）
@@ -961,11 +963,13 @@ function syncCalendarToNotion(days = (typeof SYNC !== 'undefined' && SYNC.CAL_TO
           || (legacyUid ? idToPage.get(legacyUid) : null);
 
         if (matchedPage) {
-          // 既存ページを更新（日時・タイトル等）。IDは安定ID（canonicalId）へ移行
-          updateNotionPageFromEvent(matchedPage.id, event);
-          // マップを安定IDで更新
-          idToPage.set(stableId, matchedPage);
-          updated++;
+          // 差分がある場合のみ更新（無駄なPATCHと更新カウントを抑制）
+          if (shouldUpdateNotionPage(matchedPage, event)) {
+            updateNotionPageFromEvent(matchedPage.id, event);
+            // マップを安定IDで更新
+            idToPage.set(stableId, matchedPage);
+            updated++;
+          }
         } else {
           // 新しいページを作成（IDは安定IDで保存）
           createNotionPage(event);
@@ -995,6 +999,61 @@ function syncCalendarToNotion(days = (typeof SYNC !== 'undefined' && SYNC.CAL_TO
   } catch (error) {
     Logger.log(`カレンダー→Notion同期エラー: ${error.toString()}`);
     throw error;
+  }
+}
+
+/**
+ * Notionページがイベント内容と一致しているか（更新が必要か）
+ */
+function shouldUpdateNotionPage(notionPage, eventData) {
+  try {
+    const props = notionPage.properties || {};
+    const expectedTitle = eventData.title || 'Untitled Event';
+    const actualTitle = getNotionText(props['Name']) || '';
+
+    const expectedDate = buildNotionDateForEvent(eventData);
+    const actualDate = (props['日付'] && props['日付'].date) ? props['日付'].date : null;
+    const actualStart = actualDate && actualDate.start ? actualDate.start : '';
+    const actualEnd = actualDate && actualDate.end ? actualDate.end : '';
+    const expectedStart = expectedDate.start || '';
+    const expectedEnd = expectedDate.end || '';
+
+    const expectedId = (eventData.canonicalId || eventData.id || '');
+    const actualId = getNotionText(props['Calendar Event ID']) || '';
+
+    const titleDiff = actualTitle !== expectedTitle;
+    const startDiff = actualStart !== expectedStart;
+    const endDiff = (actualEnd || '') !== (expectedEnd || '');
+    const idDiff = actualId !== expectedId;
+
+    return titleDiff || startDiff || endDiff || idDiff;
+  } catch (e) {
+    // 何か取得に失敗した場合は安全側で更新する
+    return true;
+  }
+}
+
+/**
+ * イベントからNotion用の日付オブジェクトを構築
+ */
+function buildNotionDateForEvent(eventData) {
+  if (eventData.isAllDay) {
+    const startDate = eventData.startDateRaw
+      ? eventData.startDateRaw
+      : Utilities.formatDate(new Date(eventData.startTime), CONFIG.TIME_ZONE, 'yyyy-MM-dd');
+    let endDate = null;
+    if (eventData.endDateRaw) {
+      const endEx = new Date(eventData.endDateRaw);
+      endEx.setDate(endEx.getDate() - 1); // 排他的end→包含endに補正
+      endDate = Utilities.formatDate(endEx, CONFIG.TIME_ZONE, 'yyyy-MM-dd');
+      if (endDate === startDate) endDate = null;
+    }
+    return { start: startDate, end: endDate };
+  } else {
+    return {
+      start: eventData.startTime ? new Date(eventData.startTime).toISOString() : null,
+      end: eventData.endTime ? new Date(eventData.endTime).toISOString() : null
+    };
   }
 }
 
@@ -1397,6 +1456,13 @@ function saveSyncResults(syncResult) {
 
     const cal = syncResult.calendarToNotion || { created: 0, updated: 0, duplicates: 0, errors: 0 };
     const noc = syncResult.notionToCalendar || { created: 0, errors: 0 };
+
+    // 変更が全くない場合はシートへの追記をスキップ（ログだけに留める）
+    const totalChanges = (cal.created || 0) + (cal.updated || 0) + (cal.errors || 0) + (noc.created || 0) + (noc.errors || 0);
+    if (totalChanges === 0) {
+      Logger.log('変更なしのためシート追記をスキップ');
+      return;
+    }
     const rowData = [
       syncResult.timestamp,
       cal.created || 0,
@@ -1431,7 +1497,8 @@ function setupTriggers() {
     clearAllTriggers();
 
     // 既定間隔で実行のトリガー
-    setPollingInterval(SYNC.SHORT_INTERVAL_MIN);
+    var intervals = (Array.isArray(SYNC.INTERVALS) && SYNC.INTERVALS.length) ? SYNC.INTERVALS : [SYNC.SHORT_INTERVAL_MIN, SYNC.LONG_INTERVAL_MIN];
+    setPollingInterval(Math.max(1, intervals[0] || 5));
 
     Logger.log('トリガー設定完了');
 
@@ -1471,32 +1538,62 @@ function setPollingInterval(minutes) {
 function adjustPollingIntervalIfNeeded(syncResult) {
   try {
     const props = PropertiesService.getScriptProperties();
-    const currentStr = props.getProperty('CURRENT_INTERVAL_MIN') || String(SYNC.SHORT_INTERVAL_MIN);
-    const currentMin = parseInt(currentStr, 10) || SYNC.SHORT_INTERVAL_MIN;
-    const stableRuns = parseInt(props.getProperty('STABLE_RUNS') || '0', 10);
+    const intervals = (Array.isArray(SYNC.INTERVALS) && SYNC.INTERVALS.length) ? SYNC.INTERVALS : [SYNC.SHORT_INTERVAL_MIN, SYNC.LONG_INTERVAL_MIN];
+    const baseMin = intervals[0] || 5;
+    const currentStr = props.getProperty('CURRENT_INTERVAL_MIN') || String(baseMin);
+    let currentMin = parseInt(currentStr, 10) || baseMin;
+    let stableRuns = parseInt(props.getProperty('STABLE_RUNS') || '0', 10);
+    let burstLeft = parseInt(props.getProperty('BURST_LEFT') || '0', 10);
 
     // 安定の定義: 作成0・変更0・エラー0（Notion→Calendarは無効のため無視）
     const created = syncResult?.calendarToNotion?.created || 0;
     const updated = syncResult?.calendarToNotion?.updated || 0;
     const errors = syncResult?.notionToCalendar?.errors || 0;
-    const isStable = created === 0 && updated === 0 && errors === 0;
+    const hasChange = (created + updated + errors) > 0;
 
-    if (isStable) {
-      const newStable = stableRuns + 1;
-      props.setProperty('STABLE_RUNS', String(newStable));
-      if (newStable >= SYNC.STABLE_THRESHOLD && currentMin !== SYNC.LONG_INTERVAL_MIN) {
+    // インターバルの現在位置（見つからなければ最初）
+    let idx = intervals.indexOf(currentMin);
+    if (idx < 0) idx = 0;
+
+    if (hasChange) {
+      // 変更検出: バーストモード起動（5分で追従）
+      props.setProperty('STABLE_RUNS', '0');
+      props.setProperty('BURST_LEFT', String(SYNC.BURST_RUNS));
+      if (currentMin !== baseMin) {
         clearAllTriggers();
-        setPollingInterval(SYNC.LONG_INTERVAL_MIN);
-        Logger.log(`安定が継続したため間隔を${SYNC.LONG_INTERVAL_MIN}分へ延長`);
+        setPollingInterval(baseMin);
+        Logger.log(`変更を検出したため間隔を${baseMin}分へ短縮（バースト開始）`);
+      }
+      return;
+    }
+
+    // 変更なし
+    if (burstLeft > 0) {
+      // バースト継続中: 5分間隔を維持してカウントダウン
+      burstLeft -= 1;
+      props.setProperty('BURST_LEFT', String(burstLeft));
+      if (currentMin !== baseMin) {
+        clearAllTriggers();
+        setPollingInterval(baseMin);
+      }
+      Logger.log(`バースト継続中（残り${burstLeft}回）。間隔は${baseMin}分`);
+      return;
+    }
+
+    // 安定カウントを進め、閾値で次の段に延長
+    stableRuns += 1;
+    props.setProperty('STABLE_RUNS', String(stableRuns));
+    if (stableRuns >= SYNC.STABLE_THRESHOLD) {
+      const nextIdx = Math.min(idx + 1, intervals.length - 1);
+      const nextMin = intervals[nextIdx];
+      if (nextMin !== currentMin) {
+        clearAllTriggers();
+        setPollingInterval(nextMin);
+        props.setProperty('STABLE_RUNS', '0');
+        Logger.log(`安定が継続したため間隔を${nextMin}分へ延長`);
       }
     } else {
-      // 不安定: 直ちに短間隔へ戻す
-      props.setProperty('STABLE_RUNS', '0');
-      if (currentMin !== SYNC.SHORT_INTERVAL_MIN) {
-        clearAllTriggers();
-        setPollingInterval(SYNC.SHORT_INTERVAL_MIN);
-        Logger.log(`更新やエラーを検出したため間隔を${SYNC.SHORT_INTERVAL_MIN}分へ短縮`);
-      }
+      Logger.log(`変化なし ${stableRuns}/${SYNC.STABLE_THRESHOLD}（間隔${currentMin}分のまま）`);
     }
   } catch (e) {
     Logger.log(`ポーリング調整例外: ${e}`);
