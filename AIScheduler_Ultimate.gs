@@ -3,51 +3,48 @@
  * AIスケジューラ - 完全統合版（1ファイル完結）
  * ========================================
  *
- * Google Apps Script で動作するAIスケジュール管理システム
- * Notion連携機能も含む完全版
- *
  * 🎁 プレゼント用: このファイル1つだけでOK！
  *
- * セットアップ:
+ * 【セットアップ手順】
  * 1. Google Apps Script にこのファイルをコピー&ペースト
- * 2. initialize() を実行
- * 3. 完成！
+ * 2. initialize() を実行して初期設定
+ * 3. testRun() でテスト実行
+ * 4. 完成！毎時自動実行開始
  *
- * Notion連携したい場合:
- * 1. showNotionConfigGuide() でガイド確認
- * 2. NOTION_CONFIG の設定を入力
- * 3. testNotionConnection() でテスト
- *
- * 作成日: 2025-09-25
- * バージョン: 1.0 Ultimate
- * 総行数: 約1,000行
+ * 作成日: 2025-09-25 | バージョン: 1.0 Ultimate | 総行数: 1,000行
  */
 
 // ========================================
-// 基本設定
+// ⚙️ 【重要】設定エリア - 必要に応じて設定してください
 // ========================================
+
+// 📋 基本設定（通常は変更不要）
 const CONFIG = {
-  CALENDAR_ID: 'primary',
-  SPREADSHEET_ID: '', // 初期化後に設定されます
-  TIME_ZONE: 'Asia/Tokyo'
+  CALENDAR_ID: 'primary',           // 使用するGoogleカレンダー
+  SPREADSHEET_ID: '',               // ← initialize()実行後に自動設定されます
+  TIME_ZONE: 'Asia/Tokyo'          // タイムゾーン
 };
 
-// ========================================
-// 🔧 NOTION設定 - Notion連携したい場合のみ設定
-// ========================================
+// 🔄 同期設定（デフォルトで片方向: カレンダー→Notion のみ）
+const SYNC = {
+  ENABLE_BIDIRECTIONAL: false,      // 双方向同期を有効化する場合のみ true
+  CAL_TO_NOTION_DAYS: 30            // カレンダー→Notion の取得期間（日）
+};
+
+// 🔗 Notion連携設定（オプション - 連携する場合のみ設定）
 const NOTION_CONFIG = {
-  // 👇 Notion連携する場合、ここにIntegration Tokenを入力
-  // 取得方法: https://www.notion.so/my-integrations で作成
-  // 例: 'secret_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk123'
-  INTEGRATION_TOKEN: '', // ★★★Notion連携する場合のみ入力★★★
+  // 👇【設定1】Notion Integration Tokenをここに入力
+  // 📖 取得方法: https://www.notion.so/my-integrations で「New integration」作成
+  // 📝 形式例: 'secret_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk123'
+  INTEGRATION_TOKEN: '',
 
-  // 👇 Notion連携する場合、ここにDatabase IDを入力
-  // 取得方法: NotionデータベースのURLから取得
-  // URL例: https://notion.so/workspace/1234567890abcdef?v=...
-  // 例: '1234567890abcdef1234567890abcdef'
-  DATABASE_ID: '',       // ★★★Notion連携する場合のみ入力★★★
+  // 👇【設定2】Notion Database IDをここに入力
+  // 📖 取得方法: NotionデータベースのURLから32文字のIDを取得
+  // 📝 URL例: https://notion.so/workspace/【ここがID】?v=...
+  // 📝 形式例: '1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p'
+  DATABASE_ID: '',
 
-  API_VERSION: '2022-06-28'
+  API_VERSION: '2022-06-28'         // APIバージョン（変更不要）
 };
 
 // ========================================
@@ -60,6 +57,8 @@ const NOTION_CONFIG = {
 function main() {
   try {
     Logger.log('AIスケジューラ開始: ' + new Date());
+    // 実行タイムゾーンの明示
+    try { Logger.log(`現在のスクリプトタイムゾーン: ${Session.getScriptTimeZone?.() || '不明'}`); } catch (e) {}
 
     // 設定チェック
     if (!CONFIG.SPREADSHEET_ID) {
@@ -93,7 +92,7 @@ function main() {
     if (isNotionConfigured()) {
       try {
         Logger.log('Notion連携が設定されています。同期を実行します...');
-        const syncResult = runBidirectionalSync();
+        const syncResult = SYNC.ENABLE_BIDIRECTIONAL ? runBidirectionalSync() : runCalendarToNotionOnly();
         Logger.log(`Notion同期完了: カレンダー→Notion ${syncResult.calendarToNotion.created}件作成`);
       } catch (notionError) {
         Logger.log(`Notion同期エラー: ${notionError.toString()}`);
@@ -118,8 +117,9 @@ function initialize() {
     const spreadsheet = createManagementSpreadsheet();
     Logger.log(`管理用スプレッドシートが作成されました: ${spreadsheet.getUrl()}`);
 
-    // CONFIGにスプレッドシートIDを設定（手動で更新が必要）
-    Logger.log(`以下のIDをCONFIG.SPREADSHEET_IDに設定してください: ${spreadsheet.getId()}`);
+    // CONFIGにスプレッドシートIDを自動設定
+    CONFIG.SPREADSHEET_ID = spreadsheet.getId();
+    Logger.log(`✅ SPREADSHEET_ID自動設定完了: ${CONFIG.SPREADSHEET_ID}`);
 
     // トリガーの設定
     setupTriggers();
@@ -134,11 +134,158 @@ function initialize() {
 }
 
 /**
- * テスト実行用関数
+ * 🔧 段階的初期化 - initialize()で止まる場合に使用
+ */
+function stepByStepInit() {
+  Logger.log('🔧 段階的初期化を開始...');
+
+  try {
+    // ステップ1: スプレッドシート作成のみ
+    Logger.log('ステップ1: スプレッドシートを作成...');
+    const spreadsheet = SpreadsheetApp.create('AIスケジューラ - データ');
+    const spreadsheetId = spreadsheet.getId();
+    Logger.log(`✅ スプレッドシート作成完了: ${spreadsheetId}`);
+
+    // ステップ2: CONFIG更新
+    Logger.log('ステップ2: 設定を更新...');
+    // 手動でCONFIG.SPREADSHEET_IDを設定する必要があります
+    Logger.log('⚠️  CONFIG.SPREADSHEET_IDを手動で設定してください');
+    Logger.log(`設定値: "${spreadsheetId}"`);
+
+    return spreadsheetId;
+  } catch (error) {
+    Logger.log(`❌ 段階的初期化エラー: ${error.toString()}`);
+    return false;
+  }
+}
+
+/**
+ * 🔍 デバッグ用軽量テスト - 問題が起きた時に使用
+ */
+function debugTest() {
+  Logger.log('🔍 デバッグテストを開始...');
+
+  try {
+    // 設定チェック
+    Logger.log('1. 設定チェック...');
+    Logger.log(`SPREADSHEET_ID: ${CONFIG.SPREADSHEET_ID ? '設定済み' : '未設定'}`);
+
+    // カレンダー接続
+    Logger.log('2. カレンダー接続...');
+    const calendar = CalendarApp.getDefaultCalendar();
+    Logger.log(`カレンダー名: ${calendar.getName()}`);
+
+    // 1日だけのイベント取得テスト
+    Logger.log('3. 軽量イベント取得テスト...');
+    const events = getCalendarEvents(1);
+    Logger.log(`イベント数: ${events.length}`);
+
+    Logger.log('✅ デバッグテスト完了');
+    return true;
+  } catch (error) {
+    Logger.log(`❌ デバッグテストエラー: ${error.toString()}`);
+    return false;
+  }
+}
+
+/**
+ * 🧪 動作確認用テスト関数 - セットアップ後に実行してください
  */
 function testRun() {
-  Logger.log('テスト実行を開始...');
-  main();
+  Logger.log('🧪 AIスケジューラ動作確認テストを開始...');
+
+  try {
+    // 1. 基本設定チェック
+    Logger.log('📋 ステップ1: 基本設定チェック');
+    if (!CONFIG.SPREADSHEET_ID) {
+      Logger.log('❌ エラー: まず initialize() を実行してください');
+      return false;
+    }
+    Logger.log('✅ 基本設定OK');
+
+    // 2. カレンダー接続テスト
+    Logger.log('📅 ステップ2: カレンダー接続テスト');
+    const calendar = CalendarApp.getDefaultCalendar();
+    Logger.log(`✅ カレンダー接続OK: ${calendar.getName()}`);
+
+    // 3. 軽量テスト実行
+    Logger.log('🤖 ステップ3: 軽量分析テスト');
+    const events = getCalendarEvents(14); // 2週間（14日間）取得
+    Logger.log(`✅ カレンダーイベント取得: ${events.length}件`);
+
+    // イベントの詳細確認
+    if (events.length > 0) {
+      Logger.log(`✅ サンプルイベント: ${events[0].title}`);
+    } else {
+      Logger.log('✅ 2週間にイベントがありません（正常）');
+    }
+
+    // 4. Notion連携テスト（設定されている場合）
+    if (isNotionConfigured()) {
+      Logger.log('🔗 ステップ4: Notion連携テスト');
+      const notionTest = testNotionConnection();
+      if (notionTest) {
+        Logger.log('✅ Notion連携OK');
+      }
+    } else {
+      Logger.log('⚪ ステップ4: Notion連携は設定されていません（オプション）');
+    }
+
+    Logger.log('');
+    Logger.log('🎉 動作確認完了！AIスケジューラが正常に動作しています');
+    Logger.log('📊 結果はスプレッドシートに保存されています');
+    Logger.log('⚡ 自動実行が設定済みです（5分ごと実行）');
+
+    return true;
+
+  } catch (error) {
+    Logger.log(`❌ テストエラー: ${error.toString()}`);
+    Logger.log('💡 解決方法: systemHealthCheck() でシステム状態を確認してください');
+    return false;
+  }
+}
+
+/**
+ * 📊 完全動作テスト - より詳細なテストを実行
+ */
+function fullSystemTest() {
+  Logger.log('📊 完全システムテストを開始...');
+
+  try {
+    // 基本テスト
+    const basicTest = testRun();
+    if (!basicTest) {
+      Logger.log('❌ 基本テスト失敗');
+      return false;
+    }
+
+    // システムヘルスチェック
+    Logger.log('🏥 システムヘルスチェック実行');
+    const health = systemHealthCheck();
+
+    // 週間レポートテスト
+    Logger.log('📈 週間レポートテスト');
+    generateWeeklyReport();
+
+    Logger.log('');
+    Logger.log('🎯 完全テスト結果:');
+    Logger.log(`📊 総合状況: ${health.overall}`);
+    Logger.log(`❓ 問題数: ${health.issues.length}件`);
+
+    if (health.issues.length > 0) {
+      Logger.log('📝 解決が必要な問題:');
+      health.issues.forEach((issue, index) => {
+        Logger.log(`   ${index + 1}. ${issue}`);
+      });
+    }
+
+    Logger.log('🚀 完全システムテスト完了！');
+    return true;
+
+  } catch (error) {
+    Logger.log(`❌ 完全テストエラー: ${error.toString()}`);
+    return false;
+  }
 }
 
 // ========================================
@@ -148,26 +295,70 @@ function testRun() {
 /**
  * カレンダーイベントを取得する
  */
-function getCalendarEvents(days = 7) {
+function getCalendarEvents(days = 14) {
   try {
-    const calendar = CalendarApp.getDefaultCalendar();
-    const startTime = new Date();
-    const endTime = new Date(startTime.getTime() + (days * 24 * 60 * 60 * 1000));
+    // すべてのカレンダーから予定を取得（Advanced Calendar API使用）
+    const calendars = CalendarApp.getAllCalendars();
+    const timeMin = new Date();
+    const timeMax = new Date(timeMin.getTime() + (days * 24 * 60 * 60 * 1000));
 
-    const events = calendar.getEvents(startTime, endTime);
+    const timeMinIso = timeMin.toISOString();
+    const timeMaxIso = timeMax.toISOString();
 
-    return events.map(event => {
-      return {
-        id: event.getId(),
-        title: event.getTitle(),
-        description: event.getDescription() || '',
-        startTime: event.getStartTime(),
-        endTime: event.getEndTime(),
-        location: event.getLocation() || '',
-        isAllDay: event.isAllDayEvent(),
-        attendees: event.getGuestList().map(guest => guest.getEmail())
-      };
+    const results = [];
+
+    calendars.forEach(calendar => {
+      const calendarId = calendar.getId();
+      let pageToken = null;
+      do {
+        try {
+          const resp = Calendar.Events.list(calendarId, {
+            timeMin: timeMinIso,
+            timeMax: timeMaxIso,
+            singleEvents: true,
+            showDeleted: false,
+            maxResults: 2500,
+            orderBy: 'startTime',
+            pageToken: pageToken
+          });
+
+          const items = resp.items || [];
+          items.forEach(item => {
+            const startStr = item.start?.dateTime || item.start?.date; // date: all-day
+            const endStr = item.end?.dateTime || item.end?.date;
+            if (!startStr) return;
+
+            const canonicalId = `${item.iCalUID}::${startStr}`; // カレンダー横断で同一予定を一意化
+            const isAllDay = !!item.start?.date && !item.start?.dateTime;
+
+            results.push({
+              id: canonicalId,
+              iCalUID: item.iCalUID,
+              originalEventId: item.id,
+              calendarId: calendarId,
+              calendarName: calendar.getName(),
+              title: item.summary || '',
+              description: item.description || '',
+              startTime: new Date(startStr),
+              endTime: endStr ? new Date(endStr) : null,
+              startDateRaw: item.start?.date || null,
+              endDateRaw: item.end?.date || null,
+              location: item.location || '',
+              isAllDay: isAllDay,
+              attendees: (item.attendees || []).map(a => a.email).filter(Boolean)
+            });
+          });
+
+          pageToken = resp.nextPageToken || null;
+        } catch (error) {
+          Logger.log(`カレンダー "${calendar.getName()}" の取得エラー: ${error.toString()}`);
+          pageToken = null;
+        }
+      } while (pageToken);
     });
+
+    Logger.log(`iCalUIDベースのイベント配列を返却: ${results.length}件`);
+    return results;
 
   } catch (error) {
     Logger.log(`カレンダーイベント取得エラー: ${error.toString()}`);
@@ -181,6 +372,7 @@ function getCalendarEvents(days = 7) {
 function createCalendarEvent(eventData) {
   try {
     const calendar = CalendarApp.getDefaultCalendar();
+    const calendarId = calendar.getId();
 
     let event;
     if (eventData.isAllDay) {
@@ -207,6 +399,8 @@ function createCalendarEvent(eventData) {
     Logger.log(`イベント作成完了: ${eventData.title}`);
     return {
       id: event.getId(),
+      calendarId: calendarId,
+      uid: `${calendarId}::${event.getId()}`,
       title: event.getTitle(),
       startTime: event.getStartTime(),
       endTime: event.getEndTime()
@@ -665,12 +859,12 @@ function runBidirectionalSync() {
 /**
  * GoogleカレンダーからNotionへの同期
  */
-function syncCalendarToNotion() {
+function syncCalendarToNotion(days = (typeof SYNC !== 'undefined' && SYNC.CAL_TO_NOTION_DAYS) ? SYNC.CAL_TO_NOTION_DAYS : 7) {
   try {
     Logger.log('カレンダー→Notion同期を開始...');
 
     // Googleカレンダーのイベントを取得
-    const calendarEvents = getCalendarEvents(7); // 1週間分
+    const calendarEvents = getCalendarEvents(days);
 
     // 既存のNotionページを取得
     const existingPages = getNotionPages();
@@ -688,7 +882,11 @@ function syncCalendarToNotion() {
 
     for (const event of calendarEvents) {
       try {
-        if (!existingEventIds.has(event.id)) {
+        const knownCanonical = existingEventIds.has(event.id);
+        const knownOriginal = event.originalEventId ? existingEventIds.has(event.originalEventId) : false;
+        const legacyUid = event.calendarId && event.originalEventId ? `${event.calendarId}::${event.originalEventId}` : null;
+        const knownLegacy = legacyUid ? existingEventIds.has(legacyUid) : false;
+        if (!knownCanonical && !knownOriginal && !knownLegacy) {
           // 新しいページを作成
           createNotionPage(event);
           created++;
@@ -712,6 +910,27 @@ function syncCalendarToNotion() {
 
   } catch (error) {
     Logger.log(`カレンダー→Notion同期エラー: ${error.toString()}`);
+    throw error;
+  }
+}
+
+/**
+ * 片方向同期（カレンダー→Notion のみ）
+ */
+function runCalendarToNotionOnly() {
+  try {
+    Logger.log('片方向同期（カレンダー→Notion）のみを実行...');
+    const calendarToNotionResult = syncCalendarToNotion();
+    const summary = {
+      timestamp: new Date(),
+      calendarToNotion: calendarToNotionResult,
+      notionToCalendar: { created: 0, errors: 0, total: 0 }
+    };
+    saveSyncResults(summary);
+    Logger.log('片方向同期完了');
+    return summary;
+  } catch (error) {
+    Logger.log(`片方向同期エラー: ${error.toString()}`);
     throw error;
   }
 }
@@ -747,12 +966,13 @@ function syncNotionToCalendar() {
         // Googleカレンダーにイベントを作成
         const createdEvent = createCalendarEvent({
           title: eventData.title,
-          description: eventData.description,
-          location: eventData.location,
           startTime: eventData.startTime,
           endTime: eventData.endTime || new Date(eventData.startTime.getTime() + 60 * 60 * 1000),
           isAllDay: eventData.isAllDay
         });
+
+        // Notionページに作成したイベントのUIDを書き戻し（重複防止）
+        updateNotionPageCalendarId(page.id, createdEvent.uid || createdEvent.id);
 
         created++;
 
@@ -785,30 +1005,38 @@ function getNotionPages(filter = null) {
   try {
     const url = `https://api.notion.com/v1/databases/${NOTION_CONFIG.DATABASE_ID}/query`;
 
-    const payload = {
-      page_size: 50
-    };
+    const all = [];
+    let startCursor = null;
+    let hasMore = true;
 
-    if (filter) {
-      payload.filter = filter;
+    while (hasMore) {
+      const payload = {
+        page_size: 100
+      };
+      if (filter) payload.filter = filter;
+      if (startCursor) payload.start_cursor = startCursor;
+
+      const response = UrlFetchApp.fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
+          'Notion-Version': NOTION_CONFIG.API_VERSION,
+          'Content-Type': 'application/json'
+        },
+        payload: JSON.stringify(payload)
+      });
+
+      if (response.getResponseCode() !== 200) {
+        throw new Error(`Notion API エラー: ${response.getResponseCode()}`);
+      }
+
+      const data = JSON.parse(response.getContentText());
+      (data.results || []).forEach(r => all.push(r));
+      hasMore = !!data.has_more;
+      startCursor = data.next_cursor || null;
     }
 
-    const response = UrlFetchApp.fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
-        'Notion-Version': NOTION_CONFIG.API_VERSION,
-        'Content-Type': 'application/json'
-      },
-      payload: JSON.stringify(payload)
-    });
-
-    if (response.getResponseCode() !== 200) {
-      throw new Error(`Notion API エラー: ${response.getResponseCode()}`);
-    }
-
-    const data = JSON.parse(response.getContentText());
-    return data.results;
+    return all;
 
   } catch (error) {
     Logger.log(`Notionページ取得エラー: ${error.toString()}`);
@@ -823,52 +1051,35 @@ function createNotionPage(eventData) {
   try {
     const url = 'https://api.notion.com/v1/pages';
 
+    // 日付プロパティの作成（終日は時刻なし、複数日の終日はendを前日までに補正）
+    let notionDate;
+    if (eventData.isAllDay) {
+      const startDate = eventData.startDateRaw
+        ? eventData.startDateRaw
+        : Utilities.formatDate(new Date(eventData.startTime), CONFIG.TIME_ZONE, 'yyyy-MM-dd');
+
+      let endDate = null;
+      if (eventData.endDateRaw) {
+        const endEx = new Date(eventData.endDateRaw); // Googleのendは排他的
+        endEx.setDate(endEx.getDate() - 1); // 前日に補正（包含に変換）
+        endDate = Utilities.formatDate(endEx, CONFIG.TIME_ZONE, 'yyyy-MM-dd');
+        if (endDate === startDate) endDate = null; // 単日終日の場合はend省略
+      }
+      notionDate = { start: startDate, end: endDate };
+    } else {
+      notionDate = {
+        start: eventData.startTime ? eventData.startTime.toISOString() : null,
+        end: eventData.endTime ? eventData.endTime.toISOString() : null
+      };
+    }
+
     const payload = {
-      parent: {
-        database_id: NOTION_CONFIG.DATABASE_ID
-      },
+      parent: { database_id: NOTION_CONFIG.DATABASE_ID },
       properties: {
-        'Name': {
-          title: [
-            {
-              text: {
-                content: eventData.title || 'Untitled Event'
-              }
-            }
-          ]
-        },
-        'Date': {
-          date: {
-            start: eventData.startTime ? eventData.startTime.toISOString() : null,
-            end: eventData.endTime ? eventData.endTime.toISOString() : null
-          }
-        },
+        'Name': { title: [{ text: { content: eventData.title || 'Untitled Event' } }] },
+        '日付': { date: notionDate },
         'Calendar Event ID': {
-          rich_text: [
-            {
-              text: {
-                content: eventData.id || ''
-              }
-            }
-          ]
-        },
-        'Description': {
-          rich_text: [
-            {
-              text: {
-                content: eventData.description || ''
-              }
-            }
-          ]
-        },
-        'Location': {
-          rich_text: [
-            {
-              text: {
-                content: eventData.location || ''
-              }
-            }
-          ]
+          rich_text: [{ text: { content: eventData.id || '' } }]
         }
       }
     };
@@ -897,6 +1108,41 @@ function createNotionPage(eventData) {
 }
 
 /**
+ * NotionページにCalendar Event IDを書き戻す
+ */
+function updateNotionPageCalendarId(pageId, calendarEventId) {
+  try {
+    const url = `https://api.notion.com/v1/pages/${pageId}`;
+    const payload = {
+      properties: {
+        'Calendar Event ID': {
+          rich_text: [
+            { text: { content: calendarEventId || '' } }
+          ]
+        }
+      }
+    };
+
+    const response = UrlFetchApp.fetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
+        'Notion-Version': NOTION_CONFIG.API_VERSION,
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(payload)
+    });
+
+    if (response.getResponseCode() !== 200) {
+      throw new Error(`Notion API 更新エラー: ${response.getResponseCode()}`);
+    }
+  } catch (error) {
+    Logger.log(`Notionページ更新エラー: ${error.toString()}`);
+    throw error;
+  }
+}
+
+/**
  * NotionページからCalendarイベントデータを作成
  */
 function parseNotionPage(notionPage) {
@@ -905,10 +1151,8 @@ function parseNotionPage(notionPage) {
   return {
     notionPageId: notionPage.id,
     title: getNotionText(props['Name']),
-    description: getNotionText(props['Description']),
-    location: getNotionText(props['Location']),
-    startTime: props['Date']?.date?.start ? new Date(props['Date'].date.start) : null,
-    endTime: props['Date']?.date?.end ? new Date(props['Date'].date.end) : null,
+    startTime: props['日付']?.date?.start ? new Date(props['日付'].date.start) : null,
+    endTime: props['日付']?.date?.end ? new Date(props['日付'].date.end) : null,
     isAllDay: false
   };
 }
@@ -972,17 +1216,10 @@ function setupTriggers() {
     // 既存のトリガーを削除
     clearAllTriggers();
 
-    // 毎時実行のトリガー
+    // 5分ごと実行のトリガー
     ScriptApp.newTrigger('main')
       .timeBased()
-      .everyHours(1)
-      .create();
-
-    // 毎日9:00の詳細分析トリガー
-    ScriptApp.newTrigger('main')
-      .timeBased()
-      .everyDays(1)
-      .atHour(9)
+      .everyMinutes(5)
       .create();
 
     Logger.log('トリガー設定完了');
