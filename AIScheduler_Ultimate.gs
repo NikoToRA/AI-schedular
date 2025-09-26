@@ -11,7 +11,7 @@
  * 3. testRun() でテスト実行
  * 4. 完成！毎時自動実行開始
  *
- * 作成日: 2025-09-25 | バージョン: 1.0 Ultimate | 総行数: 1,000行
+ * 作成日: 2025-09-25 | バージョン: 1.1 Ultimate | 総行数: 1,000行
  */
 
 // ========================================
@@ -35,6 +35,15 @@ const SYNC = {
   STABLE_THRESHOLD: 3,              // 連続安定回数で延長
   INTERVALS: [5, 15, 30, 60],       // アダプティブ間隔の階段
   BURST_RUNS: 3                     // 変更検出後、5分で追従する回数
+};
+
+// ⏰ 運用スケジュール（Quiet Hours と ベース実行間隔）
+const RUNTIME = {
+  QUIET_START_HOUR: 0,   // 0:00 から
+  QUIET_END_HOUR: 8,     // 8:00 まで休止（[0,8)）
+  BASE_INTERVAL_HOURS: 1, // ベースは1時間ごとに実行
+  BURST_SPACING_MIN: 5,   // 変更検出後の追従間隔（分）
+  BURST_TOTAL_RUNS: 3     // 合計実行回数（最初の1回 + 追加2回 = 3回）
 };
 
 // 🧹 ログ／記録のスプレッドシート行数の上限（超過分は古い順に削除）
@@ -91,6 +100,12 @@ function main() {
       return;
     }
 
+    // Quiet Hours: 0:00-8:00 は休止
+    if (isInQuietHours_()) {
+      Logger.log('Quiet Hours中のためスキップ');
+      return;
+    }
+
     // カレンダーイベント取得
     const events = getCalendarEvents();
     Logger.log(`取得イベント数: ${events.length}`);
@@ -131,10 +146,8 @@ function main() {
       }
     }
 
-    // ポーリング間隔の動的調整（Notion未設定でも実行し、安定とみなす）
-    if (SYNC.DYNAMIC_INTERVAL) {
-      try { adjustPollingIntervalIfNeeded(__syncResult || {}); } catch (e) { Logger.log(`ポーリング調整エラー: ${e}`); }
-    }
+    // 変更があれば5分間隔で追加実行（合計3回）：Quiet Hoursは除外
+    try { scheduleBurstRunsIfNeeded_(__syncResult); } catch (e) { Logger.log(`バーストスケジュールエラー: ${e}`); }
 
     Logger.log('AIスケジューラ完了: ' + new Date());
 
@@ -273,7 +286,7 @@ function testRun() {
     Logger.log('');
     Logger.log('🎉 動作確認完了！AIスケジューラが正常に動作しています');
     Logger.log('📊 結果はスプレッドシートに保存されています');
-    Logger.log('⚡ 自動実行が設定済みです（5分ごと実行）');
+    Logger.log('⚡ 自動実行が設定済みです（毎時＋変更時は5分×2回）');
 
     return true;
 
@@ -1533,9 +1546,11 @@ function setupTriggers() {
     // 既存のトリガーを削除
     clearAllTriggers();
 
-    // 既定間隔で実行のトリガー
-    var intervals = (Array.isArray(SYNC.INTERVALS) && SYNC.INTERVALS.length) ? SYNC.INTERVALS : [SYNC.SHORT_INTERVAL_MIN, SYNC.LONG_INTERVAL_MIN];
-    setPollingInterval(Math.max(1, intervals[0] || 5));
+    // ベースは1時間ごとに実行
+    ScriptApp.newTrigger('main')
+      .timeBased()
+      .everyHours(Math.max(1, RUNTIME.BASE_INTERVAL_HOURS))
+      .create();
 
     Logger.log('トリガー設定完了');
 
@@ -1573,68 +1588,8 @@ function setPollingInterval(minutes) {
  * 同期結果に応じてポーリング間隔を調整（最低限ロジック）
  */
 function adjustPollingIntervalIfNeeded(syncResult) {
-  try {
-    const props = PropertiesService.getScriptProperties();
-    const intervals = (Array.isArray(SYNC.INTERVALS) && SYNC.INTERVALS.length) ? SYNC.INTERVALS : [SYNC.SHORT_INTERVAL_MIN, SYNC.LONG_INTERVAL_MIN];
-    const baseMin = intervals[0] || 5;
-    const currentStr = props.getProperty('CURRENT_INTERVAL_MIN') || String(baseMin);
-    let currentMin = parseInt(currentStr, 10) || baseMin;
-    let stableRuns = parseInt(props.getProperty('STABLE_RUNS') || '0', 10);
-    let burstLeft = parseInt(props.getProperty('BURST_LEFT') || '0', 10);
-
-    // 安定の定義: 作成0・変更0・エラー0（Notion→Calendarは無効のため無視）
-    const created = syncResult?.calendarToNotion?.created || 0;
-    const updated = syncResult?.calendarToNotion?.updated || 0;
-    const errors = syncResult?.notionToCalendar?.errors || 0;
-    const hasChange = (created + updated + errors) > 0;
-
-    // インターバルの現在位置（見つからなければ最初）
-    let idx = intervals.indexOf(currentMin);
-    if (idx < 0) idx = 0;
-
-    if (hasChange) {
-      // 変更検出: バーストモード起動（5分で追従）
-      props.setProperty('STABLE_RUNS', '0');
-      props.setProperty('BURST_LEFT', String(SYNC.BURST_RUNS));
-      if (currentMin !== baseMin) {
-        clearAllTriggers();
-        setPollingInterval(baseMin);
-        Logger.log(`変更を検出したため間隔を${baseMin}分へ短縮（バースト開始）`);
-      }
-      return;
-    }
-
-    // 変更なし
-    if (burstLeft > 0) {
-      // バースト継続中: 5分間隔を維持してカウントダウン
-      burstLeft -= 1;
-      props.setProperty('BURST_LEFT', String(burstLeft));
-      if (currentMin !== baseMin) {
-        clearAllTriggers();
-        setPollingInterval(baseMin);
-      }
-      Logger.log(`バースト継続中（残り${burstLeft}回）。間隔は${baseMin}分`);
-      return;
-    }
-
-    // 安定カウントを進め、閾値で次の段に延長
-    stableRuns += 1;
-    props.setProperty('STABLE_RUNS', String(stableRuns));
-    if (stableRuns >= SYNC.STABLE_THRESHOLD) {
-      const nextIdx = Math.min(idx + 1, intervals.length - 1);
-      const nextMin = intervals[nextIdx];
-      if (nextMin !== currentMin) {
-        clearAllTriggers();
-        setPollingInterval(nextMin);
-        props.setProperty('STABLE_RUNS', '0');
-        Logger.log(`安定が継続したため間隔を${nextMin}分へ延長`);
-      }
-    } else {
-      Logger.log(`変化なし ${stableRuns}/${SYNC.STABLE_THRESHOLD}（間隔${currentMin}分のまま）`);
-    }
-  } catch (e) {
-    Logger.log(`ポーリング調整例外: ${e}`);
-  }
+  // 非使用（互換のため残置）: 現在は毎時ベース + バースト（ワンショットトリガー）方式
+  Logger.log('adjustPollingIntervalIfNeeded: disabled (hourly base + burst)');
 }
 
 // ========================================
@@ -1647,6 +1602,59 @@ function adjustPollingIntervalIfNeeded(syncResult) {
 function formatDateTime(dateTime) {
   const date = new Date(dateTime);
   return Utilities.formatDate(date, CONFIG.TIME_ZONE, 'MM/dd HH:mm');
+}
+
+/** Quiet Hours（0時〜8時）は実行をスキップ */
+function isInQuietHours_() {
+  try {
+    const now = new Date();
+    const hour = parseInt(Utilities.formatDate(now, CONFIG.TIME_ZONE, 'H'), 10);
+    const start = RUNTIME.QUIET_START_HOUR;
+    const end = RUNTIME.QUIET_END_HOUR;
+    // 区間 [start, end) を休止
+    if (start <= end) {
+      return hour >= start && hour < end;
+    } else {
+      // 例: 22-6 のように日またぎ
+      return (hour >= start) || (hour < end);
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 変更検出時に5分間隔の追従をワンショットで2回追加（合計3回） */
+function scheduleBurstRunsIfNeeded_(syncResult) {
+  try {
+    if (isInQuietHours_()) return;
+    const cal = syncResult && syncResult.calendarToNotion ? syncResult.calendarToNotion : { created: 0, updated: 0, errors: 0 };
+    const hasChange = (cal.created || 0) + (cal.updated || 0) + (cal.errors || 0) > 0;
+    if (!hasChange) return;
+
+    const props = PropertiesService.getScriptProperties();
+    const untilStr = props.getProperty('BURST_WINDOW_UNTIL') || '';
+    const nowTs = Date.now();
+    const untilTs = untilStr ? parseInt(untilStr, 10) : 0;
+
+    if (untilTs && nowTs < untilTs) {
+      // 既にバーストウィンドウ中 → 追加発行しない
+      return;
+    }
+
+    // 追加2回（+5分, +10分）をワンショットで設定
+    const spacingMs = Math.max(1, RUNTIME.BURST_SPACING_MIN) * 60 * 1000;
+    for (let i = 1; i <= Math.max(1, RUNTIME.BURST_TOTAL_RUNS - 1); i++) {
+      ScriptApp.newTrigger('main')
+        .timeBased()
+        .after(i * spacingMs)
+        .create();
+    }
+    const windowEnd = nowTs + (Math.max(1, RUNTIME.BURST_TOTAL_RUNS - 1) * spacingMs) + 60 * 1000; // 少し余裕
+    props.setProperty('BURST_WINDOW_UNTIL', String(windowEnd));
+    Logger.log(`バースト実行をスケジュール: +${RUNTIME.BURST_SPACING_MIN}分 × ${Math.max(1, RUNTIME.BURST_TOTAL_RUNS - 1)}回`);
+  } catch (e) {
+    Logger.log(`バーストスケジュール例外: ${e}`);
+  }
 }
 
 /**
