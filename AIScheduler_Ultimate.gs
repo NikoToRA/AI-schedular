@@ -28,7 +28,11 @@ const CONFIG = {
 // 🔄 同期設定（デフォルトで片方向: カレンダー→Notion のみ）
 const SYNC = {
   ENABLE_BIDIRECTIONAL: false,      // 双方向同期を有効化する場合のみ true
-  CAL_TO_NOTION_DAYS: 30            // カレンダー→Notion の取得期間（日）
+  CAL_TO_NOTION_DAYS: 30,           // カレンダー→Notion の取得期間（日）
+  DYNAMIC_INTERVAL: true,           // 成功が続けばポーリング間隔を延長
+  SHORT_INTERVAL_MIN: 5,            // 通常間隔（分）
+  LONG_INTERVAL_MIN: 30,            // 省コスト間隔（分）
+  STABLE_THRESHOLD: 3               // 連続安定回数で延長
 };
 
 // 🔗 Notion連携設定（オプション - 連携する場合のみ設定）
@@ -55,7 +59,19 @@ const NOTION_CONFIG = {
  * メイン実行関数 - トリガーから実行される
  */
 function main() {
+  let __lock = null;
   try {
+    // 排他ロック（10秒待ち）
+    try {
+      __lock = LockService.getScriptLock();
+      if (!__lock.tryLock(10000)) {
+        Logger.log('他の実行中のためスキップ（ロック取得失敗）');
+        return;
+      }
+    } catch (e) {
+      Logger.log(`ロック取得エラー: ${e}`);
+      return;
+    }
     Logger.log('AIスケジューラ開始: ' + new Date());
     // 実行タイムゾーンの明示
     try { Logger.log(`現在のスクリプトタイムゾーン: ${Session.getScriptTimeZone?.() || '不明'}`); } catch (e) {}
@@ -94,6 +110,15 @@ function main() {
         Logger.log('Notion連携が設定されています。同期を実行します...');
         const syncResult = SYNC.ENABLE_BIDIRECTIONAL ? runBidirectionalSync() : runCalendarToNotionOnly();
         Logger.log(`Notion同期完了: カレンダー→Notion ${syncResult.calendarToNotion.created}件作成`);
+        // 人間向けの要約ログ（スプレッドシートは変更せずログのみ）
+        try {
+          const cal = syncResult.calendarToNotion || { created: 0, updated: 0, duplicates: 0, errors: 0 };
+          Logger.log(`新規追加タスク: ${cal.created}件, 変更タスク: ${cal.updated || 0}件, 重複タスク: ${cal.duplicates || 0}件, 失敗: ${cal.errors || 0}件`);
+        } catch (e) {}
+        // 同期結果に基づいてポーリング間隔を動的調整（最低限）
+        if (SYNC.DYNAMIC_INTERVAL) {
+          try { adjustPollingIntervalIfNeeded(syncResult); } catch (e) { Logger.log(`ポーリング調整エラー: ${e}`); }
+        }
       } catch (notionError) {
         Logger.log(`Notion同期エラー: ${notionError.toString()}`);
       }
@@ -103,6 +128,8 @@ function main() {
 
   } catch (error) {
     Logger.log(`エラー: ${error.toString()}`);
+  } finally {
+    try { if (__lock) __lock.releaseLock(); } catch (e) {}
   }
 }
 
@@ -312,29 +339,45 @@ function getCalendarEvents(days = 14) {
       let pageToken = null;
       do {
         try {
-          const resp = Calendar.Events.list(calendarId, {
-            timeMin: timeMinIso,
-            timeMax: timeMaxIso,
-            singleEvents: true,
-            showDeleted: false,
-            maxResults: 2500,
-            orderBy: 'startTime',
-            pageToken: pageToken
-          });
+          let resp;
+          let ok = false;
+          for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+            try {
+              resp = Calendar.Events.list(calendarId, {
+                timeMin: timeMinIso,
+                timeMax: timeMaxIso,
+                singleEvents: true,
+                showDeleted: false,
+                maxResults: 2500,
+                orderBy: 'startTime',
+                pageToken: pageToken
+              });
+              ok = true;
+            } catch (e) {
+              if (attempt === 2) throw e;
+              Utilities.sleep(500 * Math.pow(2, attempt));
+            }
+          }
 
           const items = resp.items || [];
           items.forEach(item => {
             const startStr = item.start?.dateTime || item.start?.date; // date: all-day
             const endStr = item.end?.dateTime || item.end?.date;
             if (!startStr) return;
-
-            const canonicalId = `${item.iCalUID}::${startStr}`; // カレンダー横断で同一予定を一意化
+            // 旧キー（後方互換用）: iCalUID::start
+            const legacyCurrentKey = `${item.iCalUID}::${startStr}`;
+            // 繰り返しの例外対応: originalStartTime があればそれを使う
+            const originalStartStr = item.originalStartTime?.dateTime || item.originalStartTime?.date || null;
+            // 新しい正規キー: 単発= iCalUID / 繰り返しインスタンス= iCalUID::originalStart
+            const canonicalId = originalStartStr ? `${item.iCalUID}::${originalStartStr}` : `${item.iCalUID}`;
             const isAllDay = !!item.start?.date && !item.start?.dateTime;
 
             results.push({
               id: canonicalId,
+              canonicalId: canonicalId,
               iCalUID: item.iCalUID,
               originalEventId: item.id,
+              recurringEventId: item.recurringEventId || null,
               calendarId: calendarId,
               calendarName: calendar.getName(),
               title: item.summary || '',
@@ -343,6 +386,9 @@ function getCalendarEvents(days = 14) {
               endTime: endStr ? new Date(endStr) : null,
               startDateRaw: item.start?.date || null,
               endDateRaw: item.end?.date || null,
+              startRaw: startStr || null,
+              originalStartRaw: originalStartStr,
+              legacyCurrentKey: legacyCurrentKey,
               location: item.location || '',
               isAllDay: isAllDay,
               attendees: (item.attendees || []).map(a => a.email).filter(Boolean)
@@ -713,9 +759,12 @@ function createNotionSyncSheet(spreadsheet) {
     '同期日時',
     'カレンダー→Notion作成',
     'カレンダー→Notion更新',
+    'カレンダー→Notion重複',
+    'カレンダー→Notion失敗',
     'Notion→カレンダー作成',
-    'エラー数',
-    'ステータス'
+    'Notion→カレンダー失敗',
+    'ステータス',
+    '備考'
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -725,9 +774,12 @@ function createNotionSyncSheet(spreadsheet) {
   sheet.setColumnWidth(1, 150); // 同期日時
   sheet.setColumnWidth(2, 120); // カレンダー→Notion作成
   sheet.setColumnWidth(3, 120); // カレンダー→Notion更新
-  sheet.setColumnWidth(4, 120); // Notion→カレンダー作成
-  sheet.setColumnWidth(5, 80);  // エラー数
-  sheet.setColumnWidth(6, 100); // ステータス
+  sheet.setColumnWidth(4, 120); // カレンダー→Notion重複
+  sheet.setColumnWidth(5, 120); // カレンダー→Notion失敗
+  sheet.setColumnWidth(6, 150); // Notion→カレンダー作成
+  sheet.setColumnWidth(7, 120); // Notion→カレンダー失敗
+  sheet.setColumnWidth(8, 100); // ステータス
+  sheet.setColumnWidth(9, 200); // 備考
 
   Logger.log('Notion同期結果シート作成完了');
   return sheet;
@@ -863,31 +915,59 @@ function syncCalendarToNotion(days = (typeof SYNC !== 'undefined' && SYNC.CAL_TO
   try {
     Logger.log('カレンダー→Notion同期を開始...');
 
+    // スキーマ検証
+    if (!validateNotionSchema()) {
+      Logger.log('Notionスキーマが不正のため、同期を中止します。');
+      return { created: 0, updated: 0, duplicates: 0, errors: 1, total: 0 };
+    }
+
     // Googleカレンダーのイベントを取得
     const calendarEvents = getCalendarEvents(days);
 
-    // 既存のNotionページを取得
+    // 既存のNotionページを取得（ID→ページのマップを構築）
     const existingPages = getNotionPages();
-    const existingEventIds = new Set();
-
+    const idToPage = new Map();
     existingPages.forEach(page => {
       const eventId = getNotionText(page.properties['Calendar Event ID']);
       if (eventId) {
-        existingEventIds.add(eventId);
+        // 最初に見つかったものを採用
+        if (!idToPage.has(eventId)) idToPage.set(eventId, page);
       }
     });
 
     let created = 0;
     let updated = 0;
+    let duplicates = 0;
+    let errors = 0;
+
+    const processedStableIds = new Set();
 
     for (const event of calendarEvents) {
       try {
-        const knownCanonical = existingEventIds.has(event.id);
-        const knownOriginal = event.originalEventId ? existingEventIds.has(event.originalEventId) : false;
+        const stableId = event.canonicalId || event.id;
+
+        // 同じ安定IDを複数回見つけたら重複としてスキップ
+        if (processedStableIds.has(stableId)) {
+          duplicates++;
+          continue;
+        }
+        processedStableIds.add(stableId);
         const legacyUid = event.calendarId && event.originalEventId ? `${event.calendarId}::${event.originalEventId}` : null;
-        const knownLegacy = legacyUid ? existingEventIds.has(legacyUid) : false;
-        if (!knownCanonical && !knownOriginal && !knownLegacy) {
-          // 新しいページを作成
+
+        // 後方互換: 旧キー（iCalUID::start）, さらにGoogle event.id と legacy calendarId::eventId も探索
+        const matchedPage = idToPage.get(stableId)
+          || (event.legacyCurrentKey ? idToPage.get(event.legacyCurrentKey) : null)
+          || idToPage.get(event.originalEventId)
+          || (legacyUid ? idToPage.get(legacyUid) : null);
+
+        if (matchedPage) {
+          // 既存ページを更新（日時・タイトル等）。IDは安定ID（canonicalId）へ移行
+          updateNotionPageFromEvent(matchedPage.id, event);
+          // マップを安定IDで更新
+          idToPage.set(stableId, matchedPage);
+          updated++;
+        } else {
+          // 新しいページを作成（IDは安定IDで保存）
           createNotionPage(event);
           created++;
         }
@@ -897,14 +977,18 @@ function syncCalendarToNotion(days = (typeof SYNC !== 'undefined' && SYNC.CAL_TO
 
       } catch (error) {
         Logger.log(`イベント同期エラー (${event.title}): ${error.toString()}`);
+        errors++;
       }
     }
 
-    Logger.log(`カレンダー→Notion同期完了: 作成${created}件`);
+    Logger.log(`カレンダー→Notion同期完了: 作成${created}件, 変更${updated}件, 重複${duplicates}件, 失敗${errors}件`);
+    Logger.log(`新規追加タスク: ${created}件, 変更タスク: ${updated}件, 重複タスク: ${duplicates}件, 失敗: ${errors}件`);
 
     return {
       created: created,
       updated: updated,
+      duplicates: duplicates,
+      errors: errors,
       total: calendarEvents.length
     };
 
@@ -1016,21 +1100,22 @@ function getNotionPages(filter = null) {
       if (filter) payload.filter = filter;
       if (startCursor) payload.start_cursor = startCursor;
 
-      const response = UrlFetchApp.fetch(url, {
-        method: 'POST',
+      const response = httpFetchWithBackoff(url, {
+        method: 'post',
         headers: {
           'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
           'Notion-Version': NOTION_CONFIG.API_VERSION,
           'Content-Type': 'application/json'
         },
-        payload: JSON.stringify(payload)
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
       });
 
-      if (response.getResponseCode() !== 200) {
+      if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
         throw new Error(`Notion API エラー: ${response.getResponseCode()}`);
       }
 
-      const data = JSON.parse(response.getContentText());
+      const data = JSON.parse(response.getContentText() || '{}');
       (data.results || []).forEach(r => all.push(r));
       hasMore = !!data.has_more;
       startCursor = data.next_cursor || null;
@@ -1041,6 +1126,47 @@ function getNotionPages(filter = null) {
   } catch (error) {
     Logger.log(`Notionページ取得エラー: ${error.toString()}`);
     throw error;
+  }
+}
+
+/**
+ * Notionデータベースのスキーマを検証
+ */
+function validateNotionSchema() {
+  try {
+    const url = `https://api.notion.com/v1/databases/${NOTION_CONFIG.DATABASE_ID}`;
+    const response = httpFetchWithBackoff(url, {
+      method: 'get',
+      headers: {
+        'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
+        'Notion-Version': NOTION_CONFIG.API_VERSION
+      },
+      muteHttpExceptions: true
+    });
+
+    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
+      throw new Error(`Notion DB取得エラー: ${response.getResponseCode()}`);
+    }
+
+    const data = JSON.parse(response.getContentText() || '{}');
+    const props = data.properties || {};
+
+    const nameOk = props['Name'] && props['Name'].type === 'title';
+    const dateOk = props['日付'] && props['日付'].type === 'date';
+    const idOk = props['Calendar Event ID'] && props['Calendar Event ID'].type === 'rich_text';
+
+    if (!nameOk || !dateOk || !idOk) {
+      Logger.log('Notionデータベースのプロパティが期待と一致しません。');
+      Logger.log(`- Name: ${nameOk ? 'OK' : 'NG(Title型が必要)'}`);
+      Logger.log(`- 日付: ${dateOk ? 'OK' : 'NG(Date型が必要)'}`);
+      Logger.log(`- Calendar Event ID: ${idOk ? 'OK' : 'NG(Rich Text型が必要)'}`);
+      Logger.log('showNotionConfigGuide() を確認し、データベースのプロパティを修正してください。');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    Logger.log(`Notionスキーマ検証エラー: ${e}`);
+    return false;
   }
 }
 
@@ -1079,26 +1205,28 @@ function createNotionPage(eventData) {
         'Name': { title: [{ text: { content: eventData.title || 'Untitled Event' } }] },
         '日付': { date: notionDate },
         'Calendar Event ID': {
-          rich_text: [{ text: { content: eventData.id || '' } }]
+          // 正規キーを保存（単発: iCalUID, 繰り返し: iCalUID::originalStart）
+          rich_text: [{ text: { content: (eventData.canonicalId || eventData.id || '') } }]
         }
       }
     };
 
-    const response = UrlFetchApp.fetch(url, {
-      method: 'POST',
+    const response = httpFetchWithBackoff(url, {
+      method: 'post',
       headers: {
         'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
         'Notion-Version': NOTION_CONFIG.API_VERSION,
         'Content-Type': 'application/json'
       },
-      payload: JSON.stringify(payload)
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
     });
 
-    if (response.getResponseCode() !== 200) {
+    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
       throw new Error(`Notion API エラー: ${response.getResponseCode()}`);
     }
 
-    const data = JSON.parse(response.getContentText());
+    const data = JSON.parse(response.getContentText() || '{}');
     return data;
 
   } catch (error) {
@@ -1123,17 +1251,75 @@ function updateNotionPageCalendarId(pageId, calendarEventId) {
       }
     };
 
-    const response = UrlFetchApp.fetch(url, {
-      method: 'PATCH',
+  const response = httpFetchWithBackoff(url, {
+    method: 'patch',
+    headers: {
+      'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
+      'Notion-Version': NOTION_CONFIG.API_VERSION,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
+    throw new Error(`Notion API 更新エラー: ${response.getResponseCode()}`);
+  }
+  } catch (error) {
+    Logger.log(`Notionページ更新エラー: ${error.toString()}`);
+    throw error;
+  }
+}
+
+/**
+ * 既存Notionページをイベント内容で更新（タイトル・日付・ID移行）
+ */
+function updateNotionPageFromEvent(pageId, eventData) {
+  try {
+    // 日付プロパティをイベントと同様の規則で構築
+    let notionDate;
+    if (eventData.isAllDay) {
+      const startDate = eventData.startDateRaw
+        ? eventData.startDateRaw
+        : Utilities.formatDate(new Date(eventData.startTime), CONFIG.TIME_ZONE, 'yyyy-MM-dd');
+      let endDate = null;
+      if (eventData.endDateRaw) {
+        const endEx = new Date(eventData.endDateRaw);
+        endEx.setDate(endEx.getDate() - 1);
+        endDate = Utilities.formatDate(endEx, CONFIG.TIME_ZONE, 'yyyy-MM-dd');
+        if (endDate === startDate) endDate = null;
+      }
+      notionDate = { start: startDate, end: endDate };
+    } else {
+      notionDate = {
+        start: eventData.startTime ? new Date(eventData.startTime).toISOString() : null,
+        end: eventData.endTime ? new Date(eventData.endTime).toISOString() : null
+      };
+    }
+
+    const url = `https://api.notion.com/v1/pages/${pageId}`;
+    const payload = {
+      properties: {
+        'Name': { title: [{ text: { content: eventData.title || 'Untitled Event' } }] },
+        '日付': { date: notionDate },
+        'Calendar Event ID': {
+          rich_text: [{ text: { content: (eventData.canonicalId || eventData.id || '') } }]
+        }
+      }
+    };
+
+    const response = httpFetchWithBackoff(url, {
+      method: 'patch',
       headers: {
         'Authorization': `Bearer ${NOTION_CONFIG.INTEGRATION_TOKEN}`,
         'Notion-Version': NOTION_CONFIG.API_VERSION,
         'Content-Type': 'application/json'
       },
-      payload: JSON.stringify(payload)
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
     });
 
-    if (response.getResponseCode() !== 200) {
+    if (response.getResponseCode() < 200 || response.getResponseCode() >= 300) {
       throw new Error(`Notion API 更新エラー: ${response.getResponseCode()}`);
     }
   } catch (error) {
@@ -1182,17 +1368,45 @@ function saveSyncResults(syncResult) {
     if (!CONFIG.SPREADSHEET_ID) return;
 
     const spreadsheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const sheet = spreadsheet.getSheetByName('Notion同期結果');
+    let sheet = spreadsheet.getSheetByName('Notion同期結果');
+    if (!sheet) {
+      sheet = createNotionSyncSheet(spreadsheet);
+    } else {
+      // 既存シートのヘッダーを新フォーマットにマイグレーション
+      const neededCols = 9; // 新ヘッダー列数
+      const currentCols = sheet.getMaxColumns();
+      if (currentCols < neededCols) {
+        sheet.insertColumnsAfter(currentCols, neededCols - currentCols);
+      }
+      const header = sheet.getRange(1,1,1,neededCols).getValues()[0];
+      if (!header || header[0] !== '同期日時' || header[8] !== '備考') {
+        const headers = [
+          '同期日時',
+          'カレンダー→Notion作成',
+          'カレンダー→Notion更新',
+          'カレンダー→Notion重複',
+          'カレンダー→Notion失敗',
+          'Notion→カレンダー作成',
+          'Notion→カレンダー失敗',
+          'ステータス',
+          '備考'
+        ];
+        sheet.getRange(1,1,1,headers.length).setValues([headers]);
+      }
+    }
 
-    if (!sheet) return;
-
+    const cal = syncResult.calendarToNotion || { created: 0, updated: 0, duplicates: 0, errors: 0 };
+    const noc = syncResult.notionToCalendar || { created: 0, errors: 0 };
     const rowData = [
       syncResult.timestamp,
-      syncResult.calendarToNotion.created,
-      syncResult.calendarToNotion.updated || 0,
-      syncResult.notionToCalendar.created,
-      syncResult.notionToCalendar.errors || 0,
-      'Success'
+      cal.created || 0,
+      cal.updated || 0,
+      cal.duplicates || 0,
+      cal.errors || 0,
+      noc.created || 0,
+      noc.errors || 0,
+      'Success',
+      ''
     ];
 
     sheet.appendRow(rowData);
@@ -1216,11 +1430,8 @@ function setupTriggers() {
     // 既存のトリガーを削除
     clearAllTriggers();
 
-    // 5分ごと実行のトリガー
-    ScriptApp.newTrigger('main')
-      .timeBased()
-      .everyMinutes(5)
-      .create();
+    // 既定間隔で実行のトリガー
+    setPollingInterval(SYNC.SHORT_INTERVAL_MIN);
 
     Logger.log('トリガー設定完了');
 
@@ -1239,6 +1450,57 @@ function clearAllTriggers() {
     ScriptApp.deleteTrigger(trigger);
   });
   Logger.log(`既存トリガー削除完了: ${triggers.length}個`);
+}
+
+/**
+ * ポーリング間隔を設定（分）
+ */
+function setPollingInterval(minutes) {
+  ScriptApp.newTrigger('main')
+    .timeBased()
+    .everyMinutes(Math.max(1, Math.min(60, minutes)))
+    .create();
+  // 設定を記録
+  PropertiesService.getScriptProperties().setProperty('CURRENT_INTERVAL_MIN', String(minutes));
+  Logger.log(`トリガーを${minutes}分間隔に設定`);
+}
+
+/**
+ * 同期結果に応じてポーリング間隔を調整（最低限ロジック）
+ */
+function adjustPollingIntervalIfNeeded(syncResult) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const currentStr = props.getProperty('CURRENT_INTERVAL_MIN') || String(SYNC.SHORT_INTERVAL_MIN);
+    const currentMin = parseInt(currentStr, 10) || SYNC.SHORT_INTERVAL_MIN;
+    const stableRuns = parseInt(props.getProperty('STABLE_RUNS') || '0', 10);
+
+    // 安定の定義: 作成0・変更0・エラー0（Notion→Calendarは無効のため無視）
+    const created = syncResult?.calendarToNotion?.created || 0;
+    const updated = syncResult?.calendarToNotion?.updated || 0;
+    const errors = syncResult?.notionToCalendar?.errors || 0;
+    const isStable = created === 0 && updated === 0 && errors === 0;
+
+    if (isStable) {
+      const newStable = stableRuns + 1;
+      props.setProperty('STABLE_RUNS', String(newStable));
+      if (newStable >= SYNC.STABLE_THRESHOLD && currentMin !== SYNC.LONG_INTERVAL_MIN) {
+        clearAllTriggers();
+        setPollingInterval(SYNC.LONG_INTERVAL_MIN);
+        Logger.log(`安定が継続したため間隔を${SYNC.LONG_INTERVAL_MIN}分へ延長`);
+      }
+    } else {
+      // 不安定: 直ちに短間隔へ戻す
+      props.setProperty('STABLE_RUNS', '0');
+      if (currentMin !== SYNC.SHORT_INTERVAL_MIN) {
+        clearAllTriggers();
+        setPollingInterval(SYNC.SHORT_INTERVAL_MIN);
+        Logger.log(`更新やエラーを検出したため間隔を${SYNC.SHORT_INTERVAL_MIN}分へ短縮`);
+      }
+    }
+  } catch (e) {
+    Logger.log(`ポーリング調整例外: ${e}`);
+  }
 }
 
 // ========================================
@@ -1487,6 +1749,32 @@ Logger.log(`
 
 🎁 このファイル1つだけで完結する完全なAIスケジューラです！
 `);
+
+/**
+ * HTTPフェッチ（指数バックオフ付き）
+ */
+function httpFetchWithBackoff(url, options, maxRetries = 3) {
+  let attempt = 0;
+  let lastError = null;
+  let delay = 500; // ms
+  while (attempt < maxRetries) {
+    try {
+      const resp = UrlFetchApp.fetch(url, options);
+      const code = resp.getResponseCode();
+      if (code === 429 || code >= 500) {
+        throw new Error(`HTTP ${code}`);
+      }
+      return resp;
+    } catch (e) {
+      lastError = e;
+      attempt++;
+      if (attempt >= maxRetries) break;
+      Utilities.sleep(delay);
+      delay *= 2;
+    }
+  }
+  throw lastError || new Error('httpFetchWithBackoff: unknown error');
+}
 
 /**
  * ========================================
